@@ -26,15 +26,16 @@ ACTIVATIONS = {
     "gelu": nn.GELU,
     "silu": nn.SiLU,
     "elu": nn.ELU,
+    "none": nn.Identity
 }
 
 class classifier(nn.Module):
     def __init__(self, activation):
         super().__init__()
         self.flatten = nn.Flatten()
-        self.linear1 = nn.Linear(28 * 28, 100 * 100)
+        self.linear1 = nn.Linear(28 * 28, 28 * 28)
         self.activation1 = ACTIVATIONS[activation]()
-        self.linear2 = nn.Linear(100 * 100, 10)
+        self.linear2 = nn.Linear(28 * 28, 10)
 
     def forward(self, x):
         x = self.flatten(x)
@@ -55,27 +56,32 @@ def applyTransform(batch):
     batch["image"] = [transform(img) for img in batch["image"]]
     return batch
 
-def train(model, epochCount, activationName):
-    hfDataset = load_dataset("ylecun/mnist")
-    valDataset = hfDataset["test"].train_test_split(test_size = 0.5, seed = 67)["train"] #Splits test set into validation (50%) and test (50%) sets
-    hfDataset["train"].set_transform(applyTransform)
-    valDataset.set_transform(applyTransform)
+def toTensorDataset(split):
+    x = torch.stack([transform(img) for img in split["image"]])
+    y = torch.tensor(split["label"])
+    return torch.utils.data.TensorDataset(x, y)
 
-    trainingLoader = torch.utils.data.DataLoader(hfDataset["train"], batch_size = 256, shuffle = True, num_workers = 4, pin_memory = True)
-    validatingLoader = torch.utils.data.DataLoader(valDataset, batch_size = 256, shuffle = True, num_workers = 4, pin_memory = True)
+rawDataset = load_dataset("ylecun/mnist")
+trainDataset = toTensorDataset(rawDataset["train"])
+valDataset = toTensorDataset(rawDataset["test"].train_test_split(test_size = 0.5, seed = 67)["train"])  # same val split as before
+
+def train(model, epochCount, activationName, curSeed):
+    curGen = torch.Generator().manual_seed(curSeed)
+    trainingLoader = torch.utils.data.DataLoader(trainDataset, batch_size = 256, shuffle = True, generator = curGen)
+    validatingLoader = torch.utils.data.DataLoader(valDataset, batch_size = 256)
 
     lossFunction = nn.CrossEntropyLoss()
     optimiser = torch.optim.AdamW(model.parameters(), lr = 1e-4)
-    earlyStopping = EarlyStopping(patience=5, verbose=True)
+    earlyStopping = EarlyStopping(patience=5, verbose=True, path = "earlyStop.pth")
 
-    print("Beginning training")
-    writer = SummaryWriter(f"runs/{activationName}")
+    print(f"Beginning training of {activationName} with seed = {curSeed}")
+    writer = SummaryWriter(f"runs/{activationName}_{curSeed}")
     for i in range(0, epochCount):
         model.train()
         trainTotal = 0.0
         trainCorrect = 0.0
-        for j, data in enumerate(trainingLoader):
-            inputs, labels = data["image"], data["label"]
+        trainLoss = 0.0
+        for inputs, labels in trainingLoader:
             inputs = inputs.to(device)
             labels = labels.to(device)
             optimiser.zero_grad() #Set all gradients to 0
@@ -86,36 +92,39 @@ def train(model, epochCount, activationName):
             prediction = output.argmax(1)
             trainTotal += len(labels)
             trainCorrect += (prediction == labels).sum().item()
+            trainLoss += loss.item() * len(labels)
         model.eval()
         validateTotal = 0.0
         validateCorrect = 0.0
         validateLoss = 0.0
-        for j, data in enumerate(validatingLoader):
-            inputs, labels = data["image"], data["label"]
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            output = model(inputs)
-            prediction = output.argmax(1)
-            validateLoss += lossFunction(output, labels).item() * len(labels)
-            validateTotal += len(labels)
-            validateCorrect += (prediction == labels).sum().item()
+        for inputs, labels in validatingLoader:
+            with torch.no_grad():
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                output = model(inputs)
+                prediction = output.argmax(1)
+                validateLoss += lossFunction(output, labels).item() * len(labels)
+                validateTotal += len(labels)
+                validateCorrect += (prediction == labels).sum().item()
 
         trainAccuracy = (trainCorrect / trainTotal) * 100
         validateAccuracy = (validateCorrect / validateTotal) * 100
         writer.add_scalar("Accuracy/train", trainAccuracy, i)
         writer.add_scalar("Accuracy/val", validateAccuracy, i)
-        print(f"{activationName}'s epoch {i} had testing accuracy of {trainAccuracy}% and validating accuracy of {validateAccuracy}%")
+        writer.add_scalar("Loss/train", trainLoss / trainTotal, i)
+        writer.add_scalar("Loss/val", validateLoss / validateTotal, i)
 
         earlyStopping(validateLoss, model)
         if earlyStopping.early_stop:
-            print(f"{activationName}: early stopping triggered at epoch {i}")
+            print(f"{activationName} (Seed = {curSeed}): early stopping triggered at epoch {i}")
             break
     writer.close()
-    torch.save(model.state_dict(), "model.pth")
+    model.load_state_dict(torch.load("earlyStop.pth"))
+    torch.save(model.state_dict(), f"model_{activationName}_{curSeed}.pth")
 
-def test(model, testCount, runName):
+def test(model, testCount, runName, curSeed):
     hfDataset = load_dataset("ylecun/mnist")
-    testDataset = hfDataset["test"].shuffle(seed = 67).select(range(testCount)).train_test_split(test_size = 0.5, seed = 67)["test"]  # Splits test set into validation (50%) and test (50%) sets
+    testDataset = hfDataset["test"].shuffle(seed = curSeed).select(range(testCount)).train_test_split(test_size = 0.5, seed = curSeed)["test"]  # Splits test set into validation (50%) and test (50%) sets
     testDataset.set_transform(applyTransform)
     testingLoader = torch.utils.data.DataLoader(testDataset, batch_size = 1)
 
@@ -140,10 +149,9 @@ def test(model, testCount, runName):
         axBar.set_xlabel("Digit")
         axBar.set_ylabel("Confidence (%)")
 
-        fig.suptitle(f"{runName} - Sample {j + 1}/{testCount}")
+        fig.suptitle(f"{runName} (seed = {curSeed}): Sample {j + 1}/{testCount}")
         plt.ioff()
         plt.show()
-
 
 
 if __name__ == '__main__':
@@ -153,14 +161,20 @@ if __name__ == '__main__':
     if input("Retrain model? Y/N") == 'Y':
         if input("Run activations experiment? Y/N") == 'Y':
             for activation in list(ACTIVATIONS):
-                model = classifier(activation).to(device)
-                train(model, epochCount = 50, activationName = activation)
-                test(model, testCount = 5, runName = activation)
+                for i in range(0, 5):
+                    torch.manual_seed(i)
+                    model = classifier(activation).to(device)
+                    train(model, epochCount = 50, activationName = activation, curSeed = i)
+                    test(model, testCount = 5, runName = activation, curSeed = i)
         else:
-            model = classifier("relu").to(device)
-            train(model, epochCount = 50, activationName = "relu")
+            activation = input("Which activation function? (See documentation)")
+            chosenSeed = input("Which seed? (0-4)")
+            model = classifier(activation).to(device)
+            train(model, epochCount = 50, activationName = activation, curSeed = chosenSeed)
+            test(model, testCount = 20, runName = activation, curSeed = chosenSeed)
     else:
-        model = classifier("relu").to(device)
-        model.load_state_dict(torch.load("model.pth", map_location = device))
-        model.eval()
-    test(model)
+        activation = input("Which activation function? (See documentation)")
+        chosenSeed = input("Which seed? (0-4)")
+        model = classifier(activation).to(device)
+        model.load_state_dict(torch.load(f"model_{activation}.pth", map_location = device))
+        test(model, testCount = 20, runName = activation, curSeed = chosenSeed)
